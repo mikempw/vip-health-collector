@@ -1,0 +1,38 @@
+{
+    "grafana": {
+        "url": "http://192.168.2.125:3000",
+        "service_account_token": "${GRAFANA_TOKEN}"
+    },
+    "prometheus": {
+        "url": "http://prometheus:9090"
+    },
+    "collection": {
+        "interval_minutes": 5,
+        "retention_days": 30
+    },
+    "scoring": {
+        "weights": {
+            "uptime": 0.25,
+            "pool_health": 0.25,
+            "cipher_security": 0.25,
+            "performance": 0.25
+        },
+        "thresholds": {
+            "critical": 70,
+            "warning": 90
+        }
+    },
+    "ciphers": {
+        "strong": [
+            "TLS_AES_256_GCM_SHA384",
+            "TLS_CHACHA20_POLY1305_SHA256"
+        ],
+        "medium": [
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        ],
+        "weak": [
+            "TLS_RSA_WITH_AES_128_CBC_SHA",
+            "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
+        ]
+    }
+}
