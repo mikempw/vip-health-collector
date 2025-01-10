@@ -12,12 +12,13 @@ application-study-tool
           config (make the folder)
               config.json
 ```
-
+```
 1. Create an admin user in Grafana and insert the token into the GRAFANA_TOKEN .env variable
 2. mkdir -p application-study-tool/vip-health-collector/config
    chmod 755 vip-health-collector
 3. Add all the appropriate files
 4. docker compose build vip-health-collector
+```
 
 Modify the existing AST .env file
 Example:
