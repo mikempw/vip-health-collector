@@ -24,19 +24,19 @@ class VIPHealthCollector:
             # Ensure VIP name starts with /
             if not vip_name.startswith('/'):
                 vip_name = '/' + vip_name
-
+            
             # Use exact working query format
             query = 'f5_virtual_server_info%7Bf5_virtual_server_name%3D%22' + vip_name + '%22%7D'
             url = "%s/api/v1/query?query=%s" % (self.prometheus_url, query)
-
+            
             response = requests.get(url)
             response.raise_for_status()
             data = response.json()
-
+            
             if data['status'] == 'success' and data['data']['result']:
                 return data['data']['result'][0]['metric'].get('f5_pool_name')
             return None
-
+            
         except Exception as e:
             logger.error("Error getting pool name for VIP %s: %s" % (vip_name, e))
             raise
@@ -60,7 +60,7 @@ class VIPHealthCollector:
                 'availability': 'f5_virtual_server_availability_ratio%7Bf5_virtual_server_name%3D%22' + vip_name + '%22%7D',
                 'enabled': 'f5_virtual_server_enabled_ratio%7Bf5_virtual_server_name%3D%22' + vip_name + '%22%7D',
                 'cpu_utilization': 'f5_virtual_server_cpu_utilization_5s%7Bf5_virtual_server_name%3D%22' + vip_name + '%22%7D',
-
+                
                 # Performance Metrics
                 'current_connections': 'f5_virtual_server_clientside_connection_count%7Bf5_virtual_server_name%3D%22' + vip_name + '%22%7D',
                 'connection_duration': 'f5_virtual_server_clientside_connection_duration_mean_milliseconds%7Bf5_virtual_server_name%3D%22' + vip_name + '%22%7D',
@@ -68,7 +68,11 @@ class VIPHealthCollector:
                 # Pool Metrics using pool name
                 'pool_availability': 'f5_pool_availability_ratio%7Bf5_pool_name%3D%22' + pool_name + '%22,availability_state%3D%22available%22%7D',
                 'pool_member_availability': 'f5_pool_member_availability_ratio%7Bf5_pool_name%3D%22' + pool_name + '%22,availability_state%3D%22available%22%7D',
-                'pool_member_count': 'f5_pool_member_count%7Bf5_pool_name%3D%22' + pool_name + '%22,active_state%3D%22active%22%7D'
+                'pool_member_count': 'f5_pool_member_count%7Bf5_pool_name%3D%22' + pool_name + '%22,active_state%3D%22active%22%7D',
+
+                # HTTP Response Metrics
+                'http_5xx_responses': 'f5_virtual_server_profile_http_responses_by_status_total%7Bf5_virtual_server_name%3D%22' + vip_name + '%22,http_status_range%3D%225xx%22%7D',
+                'http_4xx_responses': 'f5_virtual_server_profile_http_responses_by_status_total%7Bf5_virtual_server_name%3D%22' + vip_name + '%22,http_status_range%3D%224xx%22%7D'
             }
 
             for metric_name, query in metric_queries.items():
@@ -88,13 +92,14 @@ class VIPHealthCollector:
         scores = {}
         messages = []
         weights = {
-            'availability': 0.30,
-            'performance': 0.25,
-            'pool_health': 0.45
+            'availability': 0.25,
+            'performance': 0.20,
+            'pool_health': 0.35,
+            'response_health': 0.20
         }
 
         try:
-            # VIP Availability Score (30% of total by default)
+            # VIP Availability Score (25% of total by default)
             avail_data = metrics.get('availability', {}).get('data', {}).get('result', [])
             if avail_data:
                 # Check each state (available, offline, unknown)
@@ -117,7 +122,7 @@ class VIPHealthCollector:
             if enabled_data:
                 scores['enabled'] = 100 if float(enabled_data[0]['value'][1]) == 1 else 0
 
-            # Performance Score (25% of total)
+            # Performance Score (20% of total)
             perf_score = 100
             cpu_data = metrics.get('cpu_utilization', {}).get('data', {}).get('result', [])
             if cpu_data:
@@ -129,7 +134,7 @@ class VIPHealthCollector:
 
             scores['performance'] = max(0, perf_score)
 
-            # Pool Health Score (45% of total)
+            # Pool Health Score (35% of total)
             pool_score = 100
             pool_data = metrics.get('pool_availability', {}).get('data', {}).get('result', [])
             if pool_data:
@@ -137,7 +142,7 @@ class VIPHealthCollector:
 
             pool_member_data = metrics.get('pool_member_availability', {}).get('data', {}).get('result', [])
             if pool_member_data:
-                available_members = sum(1 for member in pool_member_data
+                available_members = sum(1 for member in pool_member_data 
                                      if float(member['value'][1]) == 1)
                 total_members = len(pool_member_data)
                 if total_members > 0:
@@ -145,13 +150,45 @@ class VIPHealthCollector:
 
             scores['pool_health'] = pool_score
 
+            # Response Code Health Score (20% of total)
+            http_score = 100
+            error_details = {}
+
+            # Check 5xx errors
+            http_5xx = metrics.get('http_5xx_responses', {}).get('data', {}).get('result', [])
+            if http_5xx:
+                error_5xx_count = float(http_5xx[0]['value'][1])
+                if error_5xx_count > 0:
+                    penalty = min(50, error_5xx_count * 10)  # Severe penalty for 5xx errors
+                    http_score -= penalty
+                    error_details['5xx_errors'] = {
+                        'count': error_5xx_count,
+                        'penalty': penalty
+                    }
+                    messages.append("Detected %d 5xx errors (-%d points)" % (error_5xx_count, penalty))
+
+            # Check 4xx errors
+            http_4xx = metrics.get('http_4xx_responses', {}).get('data', {}).get('result', [])
+            if http_4xx:
+                error_4xx_count = float(http_4xx[0]['value'][1])
+                if error_4xx_count > 10:  # Allow some 4xx errors
+                    penalty = min(30, (error_4xx_count - 10) * 2)  # Less severe penalty for 4xx errors
+                    http_score -= penalty
+                    error_details['4xx_errors'] = {
+                        'count': error_4xx_count,
+                        'penalty': penalty
+                    }
+                    messages.append("High number of 4xx errors: %d (-%d points)" % (error_4xx_count, penalty))
+
+            scores['response_health'] = max(0, http_score)
+
             # Normalize weights if availability was removed
             if weights:
                 weight_sum = sum(weights.values())
                 weights = {k: v/weight_sum for k, v in weights.items()}
 
             # Calculate weighted total based on available weights
-            total_score = sum(scores.get(metric, 0) * weight
+            total_score = sum(scores.get(metric, 0) * weight 
                             for metric, weight in weights.items())
 
             status = 'HEALTHY' if total_score >= 90 else 'WARNING' if total_score >= 70 else 'CRITICAL'
@@ -164,6 +201,7 @@ class VIPHealthCollector:
                     'cpu_utilization': cpu_util if 'cpu_util' in locals() else None,
                     'current_connections': metrics.get('current_connections', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
                     'connection_duration': metrics.get('connection_duration', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
+                    'error_details': error_details
                 },
                 'messages': messages,
                 'weights_used': weights,
@@ -187,13 +225,13 @@ def debug_info():
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-
+        
         vips = []
         if data.get('data', {}).get('result'):
             for result in data['data']['result']:
                 if 'f5_virtual_server_name' in result['metric']:
                     vips.append(result['metric']['f5_virtual_server_name'])
-
+        
         return jsonify({
             'prometheus_url': collector.prometheus_url,
             'available_vips': sorted(vips) if vips else [],
@@ -202,7 +240,8 @@ def debug_info():
                 'enabled': 'f5_virtual_server_enabled_ratio',
                 'cpu_utilization': 'f5_virtual_server_cpu_utilization_5s',
                 'pool_health': 'f5_pool_availability_ratio',
-                'member_health': 'f5_pool_member_availability_ratio'
+                'member_health': 'f5_pool_member_availability_ratio',
+                'http_responses': 'f5_virtual_server_profile_http_responses_by_status_total'
             }
         })
     except Exception as e:
