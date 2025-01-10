@@ -1,6 +1,6 @@
 # vip-health-collector
 Health status for integration within the AST tool
-
+```
 Folder structure and files to modify:
 application-study-tool
     docker-compose.yaml (modify it - example below)
@@ -11,10 +11,10 @@ application-study-tool
           requirements.txt
           config (make the folder)
               config.json
-
+```
 
 1. Create an admin user in Grafana and insert the token into the GRAFANA_TOKEN .env variable
-2. mkdir -p vip-health-collector/config
+2. mkdir -p application-study-tool/vip-health-collector/config
    chmod 755 vip-health-collector
 3. Add all the appropriate files
 4. docker compose build vip-health-collector
@@ -22,6 +22,7 @@ application-study-tool
 Modify the existing AST .env file
 Example:
 root@docker:/home/mike/application-study-tool# cat .env
+```
 # Grafana Environment Variables
 # These should be updated to more secure values outside of testing environments.
 GF_SECURITY_ADMIN_USER=admin
@@ -33,9 +34,9 @@ SENSOR_ID="YOUR_ID"
 
 # Grafana API key to run config helpers
 GRAFANA_TOKEN=glsa_blahblahblah
-
+```
 Modify the AST docker-compose.yaml with the following additional content
-
+```
 vip-health-collector:
     build:
       context: ./vip-health-collector
@@ -56,5 +57,5 @@ vip-health-collector:
     depends_on:
       - grafana
       - prometheus
-
+```
 
