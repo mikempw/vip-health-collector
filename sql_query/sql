@@ -1,0 +1,138 @@
+SQL Queries
+
+Overall Virtual Server Health Score
+
+SELECT 
+    timestamp AS time, 
+    vip_name, 
+    total_score 
+FROM 
+    vip_health.health_scores 
+WHERE 
+    $__timeFilter(timestamp) 
+    AND vip_name IN ($virtual_server)
+ORDER BY 
+    timestamp;
+
+
+All Virtual Servers Health
+
+SELECT
+    vip_name,
+    AVG(total_score) AS avg_health_score
+FROM vip_health.health_scores
+GROUP BY vip_name
+ORDER BY avg_health_score DESC;
+
+All Time Series
+
+SELECT
+    timestamp,
+    vip_name,
+    total_score
+FROM vip_health.health_scores
+ORDER BY timestamp;
+
+All Unhealthy scores
+
+SELECT
+    timestamp AS time, 
+    vip_name,
+    total_score,
+    status,
+    messages
+FROM vip_health.health_scores
+WHERE status != 'HEALTHY'
+ORDER BY total_score ASC
+
+
+
+Virtual Server total Health Scores
+
+SELECT *
+FROM vip_health.health_scores
+WHERE (vip_name, timestamp) IN (
+    SELECT vip_name, MAX(timestamp)
+    FROM vip_health.health_scores
+    GROUP BY vip_name
+)
+ORDER BY timestamp DESC;
+
+
+
+
+
+Just latest timestamp for anything not healtyy
+
+WITH LatestHealthScores AS (
+    SELECT
+        vip_name,
+        MAX(timestamp) AS latest_time
+    FROM
+        vip_health.health_scores
+    WHERE
+        status != 'HEALTHY'
+    GROUP BY
+        vip_name
+)
+SELECT
+    hs.timestamp AS time,
+    hs.vip_name,
+    hs.total_score,
+    hs.status,
+    hs.messages
+FROM
+    vip_health.health_scores AS hs
+JOIN
+    LatestHealthScores AS lhs
+ON
+    hs.vip_name = lhs.vip_name AND hs.timestamp = lhs.latest_time
+ORDER BY
+    hs.total_score ASC;
+
+
+
+over time
+
+
+SELECT
+    timestamp AS time,
+    vip_name,
+    total_score,
+    status,
+    messages
+FROM
+    vip_health.health_scores
+WHERE
+    $__timeFilter(timestamp)
+    AND vip_name = '$virtual_server'
+ORDER BY
+    timestamp ASC;
+
+Anamoly
+
+WITH 
+patterns AS (
+    SELECT 
+        vip_name,
+        groupArray(total_score) as score_pattern,
+        max(total_score) as max_score,
+        min(total_score) as min_score,
+        avg(total_score) as avg_score
+    FROM vip_health.health_scores
+    WHERE timestamp >= now() - INTERVAL 1 HOUR
+    GROUP BY vip_name
+)
+SELECT 
+    vip_name,
+    score_pattern,
+    CASE 
+        WHEN (max_score - min_score) > 30 THEN 'RAPID_CHANGE'
+        WHEN avg_score < 70 THEN 'SUSTAINED_LOW'
+        WHEN arrayExists(x -> x < 60, score_pattern) THEN 'CRITICAL_DIP'
+        ELSE NULL
+    END as anomaly_type
+FROM patterns
+WHERE (max_score - min_score) > 30   -- RAPID_CHANGE
+   OR avg_score < 70                 -- SUSTAINED_LOW
+   OR arrayExists(x -> x < 60, score_pattern);  -- CRITICAL_DIP
