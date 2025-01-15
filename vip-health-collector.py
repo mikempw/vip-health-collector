@@ -15,10 +15,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('vip-health-collector')
-
 app = Flask(__name__)
 collector = None
-
 
 class VIPHealthCollector:
     def __init__(self, prometheus_url: str, clickhouse_host: str):
@@ -128,6 +126,7 @@ class VIPHealthCollector:
         except Exception as e:
             logger.error("Error collecting metrics for VIP %s: %s" % (vip_name, e))
             raise
+
     def calculate_health_score(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
         """Calculate comprehensive health score"""
         scores = {}
@@ -143,7 +142,10 @@ class VIPHealthCollector:
         }
 
         try:
-            # VIP Availability Score (20% of total)
+            # Critical availability checks - these will force total_score to 0 if they fail
+            critical_failure = False
+            
+            # VIP Availability Check
             avail_data = metrics.get('availability', {}).get('data', {}).get('result', [])
             if avail_data:
                 for state in avail_data:
@@ -156,11 +158,42 @@ class VIPHealthCollector:
                             messages.append("An appropriate health monitor is necessary to determine availability health")
                         else:
                             scores['availability'] = 100 if availability_state == 'available' else 0
+                            if availability_state != 'available' or scores['availability'] == 0:
+                                critical_failure = True
+                                messages.append("VIP is not available")
                         break
 
-            enabled_data = metrics.get('enabled', {}).get('data', {}).get('result', [])
-            if enabled_data:
-                scores['enabled'] = 100 if float(enabled_data[0]['value'][1]) == 1 else 0
+            # Pool Health Critical Check
+            pool_data = metrics.get('pool_availability', {}).get('data', {}).get('result', [])
+            if pool_data:
+                pool_availability = float(pool_data[0]['value'][1])
+                if pool_availability == 0:
+                    critical_failure = True
+                    messages.append("Pool is not available")
+                
+            pool_member_data = metrics.get('pool_member_availability', {}).get('data', {}).get('result', [])
+            if pool_member_data:
+                available_members = sum(1 for member in pool_member_data
+                                     if float(member['value'][1]) == 1)
+                if available_members == 0:
+                    critical_failure = True
+                    messages.append("No pool members are available")
+
+            # If there's a critical failure, return immediately with a zero score
+            if critical_failure:
+                return {
+                    'total_score': 0,
+                    'component_scores': scores,
+                    'status': 'CRITICAL',
+                    'details': {
+                        'cpu_utilization': metrics.get('cpu_utilization', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
+                        'current_connections': metrics.get('current_connections', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
+                        'connection_duration': metrics.get('connection_duration', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
+                    },
+                    'messages': messages,
+                    'weights_used': weights,
+                    'timestamp': datetime.now().isoformat()
+                }
 
             # Performance Score (15% of total)
             perf_score = 100
@@ -178,11 +211,9 @@ class VIPHealthCollector:
 
             # Pool Health Score (20% of total)
             pool_score = 100
-            pool_data = metrics.get('pool_availability', {}).get('data', {}).get('result', [])
             if pool_data:
                 pool_score *= float(pool_data[0]['value'][1])
 
-            pool_member_data = metrics.get('pool_member_availability', {}).get('data', {}).get('result', [])
             if pool_member_data:
                 available_members = sum(1 for member in pool_member_data
                                      if float(member['value'][1]) == 1)
@@ -262,7 +293,8 @@ class VIPHealthCollector:
                     messages.append(f"Slow connections killed: {slow_killed} (-{penalty} points)")
 
             scores['connection_quality'] = max(0, conn_score)
-    # DDoS Protection Score (10% of total)
+
+            # DDoS Protection Score (10% of total)
             ddos_score = 100
             syncookie_accepts = metrics.get('syncookie_accepts', {}).get('data', {}).get('result', [])
             syncookie_rejects = metrics.get('syncookie_rejects', {}).get('data', {}).get('result', [])
@@ -297,7 +329,7 @@ class VIPHealthCollector:
                     'cpu_utilization': cpu_util if 'cpu_util' in locals() else None,
                     'current_connections': metrics.get('current_connections', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
                     'connection_duration': metrics.get('connection_duration', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
-                    'error_details': error_details
+                    'error_details': error_details if 'error_details' in locals() else {}
                 },
                 'messages': messages,
                 'weights_used': weights,
@@ -343,7 +375,8 @@ class VIPHealthCollector:
                     'vip_name': vip_name,
                     'time': current_time.strftime('%Y-%m-%d %H:%M:%S')
                 })
-    # Insert the new record
+
+            # Insert the new record
             data = {
                 'timestamp': current_time,
                 'vip_name': vip_name,
@@ -356,7 +389,7 @@ class VIPHealthCollector:
                 'connection_quality_score': health_score['component_scores'].get('connection_quality', 0),
                 'ddos_protection_score': health_score['component_scores'].get('ddos_protection', 0),
                 'status': health_score['status'],
-                'cpu_utilization': health_score['details'].get('cpu_utilization', 0),
+                'cpu_utilization': float(health_score['details'].get('cpu_utilization', 0)) if health_score['details'].get('cpu_utilization') is not None else 0.0,
                 'current_connections': int(health_score['details'].get('current_connections', 0)),
                 'connection_duration': float(health_score['details'].get('connection_duration', 0)),
                 'messages': health_score.get('messages', [])
