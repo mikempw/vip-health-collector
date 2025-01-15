@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import time
 from typing import Dict, Any, List, Optional
@@ -15,10 +15,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('vip-health-collector')
-
 app = Flask(__name__)
 collector = None
-
 
 class VIPHealthCollector:
     def __init__(self, prometheus_url: str, clickhouse_host: str):
@@ -36,6 +34,21 @@ class VIPHealthCollector:
         self._start_collection_thread()
         logger.info("Initialized collector with Prometheus URL: %s and ClickHouse host: %s" %
                    (prometheus_url, clickhouse_host))
+
+    def _start_collection_thread(self):
+        """Start background collection thread"""
+        thread = threading.Thread(target=self._collection_worker, daemon=True)
+        thread.start()
+        logger.info("Started background collection thread")
+
+    def _collection_worker(self):
+        """Background worker to periodically collect VIP health scores"""
+        while True:
+            try:
+                self.collect_all_vips()
+            except Exception as e:
+                logger.error("Error in collection worker: %s" % e)
+            time.sleep(60)  # Wait 60 seconds before next collection
 
     def get_pool_name(self, vip_name: str) -> Optional[str]:
         """Get pool name from VIP info"""
@@ -65,7 +78,7 @@ class VIPHealthCollector:
         except Exception as e:
             logger.error("Error getting pool name for VIP %s: %s" % (vip_name, e))
             raise
-
+            
     def get_vip_metrics(self, vip_name: str) -> Dict[str, Any]:
         """Collect all relevant metrics for a VIP"""
         try:
@@ -128,7 +141,145 @@ class VIPHealthCollector:
         except Exception as e:
             logger.error("Error collecting metrics for VIP %s: %s" % (vip_name, e))
             raise
-    def calculate_health_score(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+
+    def get_historical_metrics(self, vip_name: str) -> Dict[str, Any]:
+        """Get historical metrics from ClickHouse for anomaly detection"""
+        try:
+            # Get metrics from the last 7 days
+            query = """
+            SELECT
+                toDate(timestamp) as date,
+                avg(total_score) as total_score,
+                avg(availability_score) as availability_score,
+                avg(performance_score) as performance_score,
+                avg(pool_health_score) as pool_health_score,
+                avg(response_health_score) as response_health_score,
+                avg(ssl_health_score) as ssl_health_score,
+                avg(connection_quality_score) as connection_quality_score,
+                avg(ddos_protection_score) as ddos_protection_score,
+                avg(cpu_utilization) as cpu_utilization,
+                avg(current_connections) as current_connections,
+                avg(connection_duration) as connection_duration
+            FROM vip_health.health_scores
+            WHERE vip_name = %(vip_name)s
+            AND timestamp >= now() - INTERVAL 7 DAY
+            GROUP BY date
+            ORDER BY date DESC
+            """
+            
+            result = self.clickhouse_client.execute(
+                query,
+                {'vip_name': vip_name}
+            )
+
+            # Convert to dictionary with dates as keys
+            historical_data = {}
+            for row in result:
+                date_str = row[0].strftime('%Y-%m-%d')
+                historical_data[date_str] = {
+                    'total_score': float(row[1]),
+                    'availability_score': float(row[2]),
+                    'performance_score': float(row[3]),
+                    'pool_health_score': float(row[4]),
+                    'response_health_score': float(row[5]),
+                    'ssl_health_score': float(row[6]),
+                    'connection_quality_score': float(row[7]),
+                    'ddos_protection_score': float(row[8]),
+                    'cpu_utilization': float(row[9]),
+                    'current_connections': float(row[10]),
+                    'connection_duration': float(row[11])
+                }
+            
+            return historical_data
+
+        except Exception as e:
+            logger.error(f"Error getting historical metrics for VIP {vip_name}: {e}")
+            raise
+    def calculate_anomalies(self, current_metrics: Dict[str, Any], historical_data: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Calculate anomalies by comparing current metrics with historical data"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            
+            # Get the last 7 days of data (excluding today)
+            seven_day_data = {}
+            for date, metrics in historical_data.items():
+                if date != today:
+                    for metric, value in metrics.items():
+                        if metric not in seven_day_data:
+                            seven_day_data[metric] = []
+                        seven_day_data[metric].append(value)
+
+            # Calculate seven-day averages
+            seven_day_averages = {}
+            for metric, values in seven_day_data.items():
+                if values:  # Only calculate if we have historical data
+                    seven_day_averages[metric] = sum(values) / len(values)
+
+            anomalies = {
+                'day_over_day': [],
+                'seven_day': [],
+                'metrics': {}
+            }
+
+            metrics_to_check = [
+                'total_score', 'availability_score', 'performance_score',
+                'pool_health_score', 'response_health_score', 'ssl_health_score',
+                'connection_quality_score', 'ddos_protection_score', 'cpu_utilization',
+                'current_connections', 'connection_duration'
+            ]
+
+            for metric in metrics_to_check:
+                current_value = current_metrics.get(metric, 0)
+                metric_anomalies = {
+                    'current_value': current_value,
+                    'day_over_day': None,
+                    'seven_day': None
+                }
+
+                # Day-over-day comparison
+                if yesterday in historical_data:
+                    yesterday_value = historical_data[yesterday].get(metric, 0)
+                    if yesterday_value != 0:  # Avoid division by zero
+                        day_deviation = abs((current_value - yesterday_value) / yesterday_value * 100)
+                        metric_anomalies['day_over_day'] = {
+                            'value': yesterday_value,
+                            'deviation': round(day_deviation, 2)
+                        }
+                        if day_deviation > 20:
+                            anomalies['day_over_day'].append({
+                                'metric': metric,
+                                'current_value': current_value,
+                                'comparison_value': yesterday_value,
+                                'deviation': round(day_deviation, 2)
+                            })
+
+                # Seven-day comparison
+                if metric in seven_day_averages:
+                    avg_value = seven_day_averages[metric]
+                    if avg_value != 0:  # Avoid division by zero
+                        week_deviation = abs((current_value - avg_value) / avg_value * 100)
+                        metric_anomalies['seven_day'] = {
+                            'value': avg_value,
+                            'deviation': round(week_deviation, 2)
+                        }
+                        if week_deviation > 20:
+                            anomalies['seven_day'].append({
+                                'metric': metric,
+                                'current_value': current_value,
+                                'comparison_value': avg_value,
+                                'deviation': round(week_deviation, 2)
+                            })
+
+                anomalies['metrics'][metric] = metric_anomalies
+
+            return anomalies
+
+        except Exception as e:
+            logger.error("Error calculating anomalies: %s" % e)
+            raise
+
+    def calculate_health_score(self, metrics: Dict[str, Any], vip_name: str = None) -> Dict[str, Any]:
         """Calculate comprehensive health score"""
         scores = {}
         messages = []
@@ -143,7 +294,10 @@ class VIPHealthCollector:
         }
 
         try:
-            # VIP Availability Score (20% of total)
+            # Critical availability checks - these will force total_score to 0 if they fail
+            critical_failure = False
+            
+            # VIP Availability Check
             avail_data = metrics.get('availability', {}).get('data', {}).get('result', [])
             if avail_data:
                 for state in avail_data:
@@ -156,11 +310,42 @@ class VIPHealthCollector:
                             messages.append("An appropriate health monitor is necessary to determine availability health")
                         else:
                             scores['availability'] = 100 if availability_state == 'available' else 0
+                            if availability_state != 'available' or scores['availability'] == 0:
+                                critical_failure = True
+                                messages.append("VIP is not available")
                         break
 
-            enabled_data = metrics.get('enabled', {}).get('data', {}).get('result', [])
-            if enabled_data:
-                scores['enabled'] = 100 if float(enabled_data[0]['value'][1]) == 1 else 0
+            # Pool Health Critical Check
+            pool_data = metrics.get('pool_availability', {}).get('data', {}).get('result', [])
+            if pool_data:
+                pool_availability = float(pool_data[0]['value'][1])
+                if pool_availability == 0:
+                    critical_failure = True
+                    messages.append("Pool is not available")
+                
+            pool_member_data = metrics.get('pool_member_availability', {}).get('data', {}).get('result', [])
+            if pool_member_data:
+                available_members = sum(1 for member in pool_member_data
+                                     if float(member['value'][1]) == 1)
+                if available_members == 0:
+                    critical_failure = True
+                    messages.append("No pool members are available")
+
+            # If there's a critical failure, return immediately with a zero score
+            if critical_failure:
+                return {
+                    'total_score': 0,
+                    'component_scores': scores,
+                    'status': 'CRITICAL',
+                    'details': {
+                        'cpu_utilization': float(metrics.get('cpu_utilization', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1]),
+                        'current_connections': float(metrics.get('current_connections', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1]),
+                        'connection_duration': float(metrics.get('connection_duration', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1]),
+                    },
+                    'messages': messages,
+                    'weights_used': weights,
+                    'timestamp': datetime.now().isoformat()
+                }
 
             # Performance Score (15% of total)
             perf_score = 100
@@ -178,11 +363,9 @@ class VIPHealthCollector:
 
             # Pool Health Score (20% of total)
             pool_score = 100
-            pool_data = metrics.get('pool_availability', {}).get('data', {}).get('result', [])
             if pool_data:
                 pool_score *= float(pool_data[0]['value'][1])
 
-            pool_member_data = metrics.get('pool_member_availability', {}).get('data', {}).get('result', [])
             if pool_member_data:
                 available_members = sum(1 for member in pool_member_data
                                      if float(member['value'][1]) == 1)
@@ -262,7 +445,8 @@ class VIPHealthCollector:
                     messages.append(f"Slow connections killed: {slow_killed} (-{penalty} points)")
 
             scores['connection_quality'] = max(0, conn_score)
-    # DDoS Protection Score (10% of total)
+
+            # DDoS Protection Score (10% of total)
             ddos_score = 100
             syncookie_accepts = metrics.get('syncookie_accepts', {}).get('data', {}).get('result', [])
             syncookie_rejects = metrics.get('syncookie_rejects', {}).get('data', {}).get('result', [])
@@ -277,8 +461,7 @@ class VIPHealthCollector:
                         messages.append(f"High SYN cookie rejection rate: {reject_rate:.1%}")
 
             scores['ddos_protection'] = max(0, ddos_score)
-
-            # Normalize weights if any component was removed
+    # Normalize weights if any component was removed
             if weights:
                 weight_sum = sum(weights.values())
                 weights = {k: v/weight_sum for k, v in weights.items()}
@@ -289,6 +472,46 @@ class VIPHealthCollector:
 
             status = 'HEALTHY' if total_score >= 90 else 'WARNING' if total_score >= 70 else 'CRITICAL'
 
+            # Prepare current metrics for anomaly detection
+            current_metrics = {
+                'total_score': total_score,
+                'availability_score': scores.get('availability', 0),
+                'performance_score': scores.get('performance', 0),
+                'pool_health_score': scores.get('pool_health', 0),
+                'response_health_score': scores.get('response_health', 0),
+                'ssl_health_score': scores.get('ssl_health', 0),
+                'connection_quality_score': scores.get('connection_quality', 0),
+                'ddos_protection_score': scores.get('ddos_protection', 0),
+                'cpu_utilization': cpu_util if 'cpu_util' in locals() else 0,
+                'current_connections': float(metrics.get('current_connections', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1]),
+                'connection_duration': float(metrics.get('connection_duration', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1])
+            }
+
+            # Get historical data and calculate anomalies if VIP name is provided
+            anomalies = None
+            if vip_name:
+                try:
+                    historical_data = self.get_historical_metrics(vip_name)
+                    if historical_data:
+                        anomalies = self.calculate_anomalies(current_metrics, historical_data)
+                        
+                        # Add anomaly messages if any found
+                        if anomalies:
+                            for anomaly in anomalies.get('day_over_day', []):
+                                messages.append(f"Day-over-day anomaly detected in {anomaly['metric']}: "
+                                             f"Current: {anomaly['current_value']:.2f}, "
+                                             f"Yesterday: {anomaly['comparison_value']:.2f}, "
+                                             f"Deviation: {anomaly['deviation']:.2f}%")
+                            
+                            for anomaly in anomalies.get('seven_day', []):
+                                messages.append(f"Seven-day anomaly detected in {anomaly['metric']}: "
+                                             f"Current: {anomaly['current_value']:.2f}, "
+                                             f"7-day avg: {anomaly['comparison_value']:.2f}, "
+                                             f"Deviation: {anomaly['deviation']:.2f}%")
+                except Exception as e:
+                    logger.error(f"Error in anomaly detection for VIP {vip_name}: {e}")
+                    messages.append(f"Anomaly detection failed: {str(e)}")
+
             return {
                 'total_score': round(total_score, 2),
                 'component_scores': scores,
@@ -297,8 +520,9 @@ class VIPHealthCollector:
                     'cpu_utilization': cpu_util if 'cpu_util' in locals() else None,
                     'current_connections': metrics.get('current_connections', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
                     'connection_duration': metrics.get('connection_duration', {}).get('data', {}).get('result', [{}])[0].get('value', [0, 0])[-1],
-                    'error_details': error_details
+                    'error_details': error_details if 'error_details' in locals() else {}
                 },
+                'anomalies': anomalies,
                 'messages': messages,
                 'weights_used': weights,
                 'timestamp': datetime.now().isoformat()
@@ -307,6 +531,118 @@ class VIPHealthCollector:
         except Exception as e:
             logger.error("Error calculating health score: %s" % e)
             raise
+
+    def store_health_score(self, vip_name: str, health_score: Dict[str, Any]):
+        """Store health score and anomalies in ClickHouse"""
+        try:
+            current_time = datetime.now()
+
+            # Delete any existing records for this VIP in the last 5 seconds
+            self.clickhouse_client.execute("""
+                ALTER TABLE vip_health.health_scores
+                DELETE WHERE
+                vip_name = %(vip_name)s
+                AND timestamp >= toDateTime(%(time)s) - INTERVAL 5 SECOND
+                AND timestamp <= toDateTime(%(time)s)
+                """, {
+                    'vip_name': vip_name,
+                    'time': current_time.strftime('%Y-%m-%d %H:%M:%S')
+                })
+
+            # Insert the health score record
+            data = {
+                'timestamp': current_time,
+                'vip_name': vip_name,
+                'total_score': health_score['total_score'],
+                'availability_score': health_score['component_scores'].get('availability', 0),
+                'performance_score': health_score['component_scores'].get('performance', 0),
+                'pool_health_score': health_score['component_scores'].get('pool_health', 0),
+                'response_health_score': health_score['component_scores'].get('response_health', 0),
+                'ssl_health_score': health_score['component_scores'].get('ssl_health', 0),
+                'connection_quality_score': health_score['component_scores'].get('connection_quality', 0),
+                'ddos_protection_score': health_score['component_scores'].get('ddos_protection', 0),
+                'status': health_score['status'],
+                'cpu_utilization': float(health_score['details'].get('cpu_utilization', 0)) if health_score['details'].get('cpu_utilization') is not None else 0.0,
+                'current_connections': int(health_score['details'].get('current_connections', 0)),
+                'connection_duration': float(health_score['details'].get('connection_duration', 0)),
+                'messages': health_score.get('messages', [])
+            }
+
+            self.clickhouse_client.execute(
+                'INSERT INTO vip_health.health_scores VALUES',
+                [data]
+            )
+
+            # Store anomalies if present
+            if 'anomalies' in health_score:
+                anomaly_records = []
+                
+                # Process day-over-day anomalies
+                for anomaly in health_score['anomalies'].get('day_over_day', []):
+                    anomaly_records.append({
+                        'timestamp': current_time,
+                        'vip_name': vip_name,
+                        'metric': anomaly['metric'],
+                        'current_value': float(anomaly['current_value']),
+                        'comparison_value': float(anomaly['comparison_value']),
+                        'deviation': float(anomaly['deviation']),
+                        'comparison_type': 'day_over_day'
+                    })
+                
+                # Process seven-day anomalies
+                for anomaly in health_score['anomalies'].get('seven_day', []):
+                    anomaly_records.append({
+                        'timestamp': current_time,
+                        'vip_name': vip_name,
+                        'metric': anomaly['metric'],
+                        'current_value': float(anomaly['current_value']),
+                        'comparison_value': float(anomaly['comparison_value']),
+                        'deviation': float(anomaly['deviation']),
+                        'comparison_type': 'seven_day'
+                    })
+
+                if anomaly_records:
+                    # Delete any existing anomaly records for this VIP in the last 5 seconds
+                    self.clickhouse_client.execute("""
+                        ALTER TABLE vip_health.anomalies
+                        DELETE WHERE
+                        vip_name = %(vip_name)s
+                        AND timestamp >= toDateTime(%(time)s) - INTERVAL 5 SECOND
+                        AND timestamp <= toDateTime(%(time)s)
+                        """, {
+                            'vip_name': vip_name,
+                            'time': current_time.strftime('%Y-%m-%d %H:%M:%S')
+                        })
+
+                    # Insert the anomaly records
+                    self.clickhouse_client.execute(
+                        'INSERT INTO vip_health.anomalies VALUES',
+                        anomaly_records
+                    )
+
+            logger.debug("Stored health score and anomalies for VIP %s" % vip_name)
+        except Exception as e:
+            logger.error("Error storing health score for VIP %s: %s" % (vip_name, e))
+            raise
+
+    def collect_all_vips(self):
+        """Collect and store health scores for all VIPs"""
+        try:
+            vips = self.get_all_vips()
+            logger.debug("Found %d VIPs to process" % len(vips))
+
+            for vip_name in vips:
+                try:
+                    metrics = self.get_vip_metrics(vip_name)
+                    health_score = self.calculate_health_score(metrics, vip_name)  # Pass vip_name for anomaly detection
+                    self.store_health_score(vip_name, health_score)
+                except Exception as e:
+                    logger.error("Error processing VIP %s: %s" % (vip_name, e))
+                    continue
+
+            logger.debug("Completed health score collection for all VIPs")
+        except Exception as e:
+            logger.error("Error in collection cycle: %s" % e)
 
     def get_all_vips(self) -> List[str]:
         """Get list of all VIPs from Prometheus"""
@@ -327,89 +663,10 @@ class VIPHealthCollector:
             logger.error("Error getting VIP list: %s" % e)
             raise
 
-    def store_health_score(self, vip_name: str, health_score: Dict[str, Any]):
-        """Store health score in ClickHouse"""
-        try:
-            current_time = datetime.now()
-
-            # Delete any existing records for this VIP in the last 5 seconds
-            self.clickhouse_client.execute("""
-                ALTER TABLE vip_health.health_scores
-                DELETE WHERE
-                vip_name = %(vip_name)s
-                AND timestamp >= toDateTime(%(time)s) - INTERVAL 5 SECOND
-                AND timestamp <= toDateTime(%(time)s)
-                """, {
-                    'vip_name': vip_name,
-                    'time': current_time.strftime('%Y-%m-%d %H:%M:%S')
-                })
-    # Insert the new record
-            data = {
-                'timestamp': current_time,
-                'vip_name': vip_name,
-                'total_score': health_score['total_score'],
-                'availability_score': health_score['component_scores'].get('availability', 0),
-                'performance_score': health_score['component_scores'].get('performance', 0),
-                'pool_health_score': health_score['component_scores'].get('pool_health', 0),
-                'response_health_score': health_score['component_scores'].get('response_health', 0),
-                'ssl_health_score': health_score['component_scores'].get('ssl_health', 0),
-                'connection_quality_score': health_score['component_scores'].get('connection_quality', 0),
-                'ddos_protection_score': health_score['component_scores'].get('ddos_protection', 0),
-                'status': health_score['status'],
-                'cpu_utilization': health_score['details'].get('cpu_utilization', 0),
-                'current_connections': int(health_score['details'].get('current_connections', 0)),
-                'connection_duration': float(health_score['details'].get('connection_duration', 0)),
-                'messages': health_score.get('messages', [])
-            }
-
-            self.clickhouse_client.execute(
-                'INSERT INTO vip_health.health_scores VALUES',
-                [data]
-            )
-            logger.debug("Stored health score for VIP %s" % vip_name)
-        except Exception as e:
-            logger.error("Error storing health score for VIP %s: %s" % (vip_name, e))
-            raise
-
-    def collect_all_vips(self):
-        """Collect and store health scores for all VIPs"""
-        try:
-            vips = self.get_all_vips()
-            logger.debug("Found %d VIPs to process" % len(vips))
-
-            for vip_name in vips:
-                try:
-                    metrics = self.get_vip_metrics(vip_name)
-                    health_score = self.calculate_health_score(metrics)
-                    self.store_health_score(vip_name, health_score)
-                except Exception as e:
-                    logger.error("Error processing VIP %s: %s" % (vip_name, e))
-                    continue
-
-            logger.debug("Completed health score collection for all VIPs")
-        except Exception as e:
-            logger.error("Error in collection cycle: %s" % e)
-
-    def _collection_worker(self):
-        """Background worker to periodically collect VIP health scores"""
-        while True:
-            try:
-                self.collect_all_vips()
-            except Exception as e:
-                logger.error("Error in collection worker: %s" % e)
-            time.sleep(60)  # Wait 60 seconds before next collection
-
-    def _start_collection_thread(self):
-        """Start background collection thread"""
-        thread = threading.Thread(target=self._collection_worker, daemon=True)
-        thread.start()
-        logger.info("Started background collection thread")
-
 @app.route('/debug')
 def debug_info():
     """Get debug information about the collector"""
     try:
-        # Build query using exact working format
         query = 'f5_virtual_server_availability_ratio'
         url = "%s/api/v1/query?query=%s" % (collector.prometheus_url, query)
         response = requests.get(url)
@@ -444,7 +701,7 @@ def get_vip_health(vip_name):
     try:
         logger.info("Received request for VIP: %s" % vip_name)
         metrics = collector.get_vip_metrics(vip_name)
-        health_score = collector.calculate_health_score(metrics)
+        health_score = collector.calculate_health_score(metrics, vip_name)  # Pass vip_name for anomaly detection
         return jsonify(health_score)
     except Exception as e:
         logger.error("Error processing request for VIP %s: %s" % (vip_name, e))
